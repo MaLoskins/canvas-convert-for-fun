@@ -38,15 +38,10 @@ DTYPE = torch.float16
 # Common image utilities
 # ═══════════════════════════════════════════════════════════════════════
 
-def resize_and_pad(img: Image.Image, target: int, fill: int = 0) -> Image.Image:
-    """Resize preserving aspect ratio, centre-pad to target x target square."""
-    w, h = img.size
-    scale = target / max(w, h)
-    nw, nh = int(w * scale), int(h * scale)
-    img = img.resize((nw, nh), Image.LANCZOS)
-    padded = Image.new(img.mode, (target, target), fill)
-    padded.paste(img, ((target - nw) // 2, (target - nh) // 2))
-    return padded
+def resize_to_square(img: Image.Image, target: int) -> Image.Image:
+    """Resize directly to target x target. The frontend canvas is already square,
+    so this is a straight resize with no padding or aspect-ratio distortion."""
+    return img.resize((target, target), Image.LANCZOS)
 
 
 def is_blank(img: Image.Image, threshold: float = 0.005) -> bool:
@@ -68,14 +63,14 @@ def preprocess_invert_to_white_on_black(raw: bytes, size: int) -> Image.Image:
     """Black-on-white canvas -> white-on-black RGB.  Used by T2I-Adapter sketch/lineart."""
     img = Image.open(io.BytesIO(raw)).convert("L")
     img = ImageOps.invert(img)
-    img = resize_and_pad(img, size, fill=0)
+    img = resize_to_square(img, size)
     return img.convert("RGB")
 
 
 def preprocess_direct_scribble(raw: bytes, size: int) -> Image.Image:
     """Black-on-white canvas -> black-on-white RGB.  Faithful scribble pass-through."""
     img = Image.open(io.BytesIO(raw)).convert("L")
-    img = resize_and_pad(img, size, fill=255)
+    img = resize_to_square(img, size)
     return img.convert("RGB")
 
 
@@ -84,8 +79,7 @@ def preprocess_canny_like(raw: bytes, size: int) -> Image.Image:
     Invert, then threshold to clean binary for canny-style control."""
     img = Image.open(io.BytesIO(raw)).convert("L")
     img = ImageOps.invert(img)
-    img = resize_and_pad(img, size, fill=0)
-    # Threshold to clean binary edges
+    img = resize_to_square(img, size)
     img = img.point(lambda p: 255 if p > 30 else 0)
     return img.convert("RGB")
 
