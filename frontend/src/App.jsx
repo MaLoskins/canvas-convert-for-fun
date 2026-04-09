@@ -85,50 +85,6 @@ export default function App() {
       <header className="header">
         <div className="header__left">
           <span className="header__logo">Canvas</span>
-          <select
-            className="header__model-select"
-            value={activeModel || ''}
-            onChange={(e) => handleModelSwitch(e.target.value)}
-            disabled={isLoading}
-          >
-            {modelList.length === 0 && (
-              <option value="">Loading models...</option>
-            )}
-            {modelList.map((m) => (
-              <option key={m.key} value={m.key}>{m.name}</option>
-            ))}
-          </select>
-          {isUnion && (
-            <select
-              className="header__union-select"
-              value={unionMode}
-              onChange={(e) => setUnionMode(e.target.value)}
-            >
-              {(currentModelInfo?.union_modes || []).map((mode) => (
-                <option key={mode} value={mode}>{mode}</option>
-              ))}
-            </select>
-          )}
-          {currentModelInfo && (
-            <div className="header__stats">
-              <span className="header__stat" title="Output quality">
-                <span className="header__stat-label">Quality</span>
-                <span className="header__stat-value">{currentModelInfo.quality}</span>
-              </span>
-              <span className="header__stat" title="Inference speed">
-                <span className="header__stat-label">Speed</span>
-                <span className="header__stat-value">{currentModelInfo.speed}</span>
-              </span>
-              <span className="header__stat" title="How closely output follows sketch lines">
-                <span className="header__stat-label">Adherence</span>
-                <span className="header__stat-value">{currentModelInfo.adherence}</span>
-              </span>
-              <span className="header__stat" title="Model download size">
-                <span className="header__stat-label">Size</span>
-                <span className="header__stat-value">{currentModelInfo.size}</span>
-              </span>
-            </div>
-          )}
         </div>
         <div className="header__right">
           <span className="header__live">
@@ -237,6 +193,48 @@ export default function App() {
                   <span className="elapsed-badge">{lastElapsed}s</span>
                 )}
               </div>
+            </div>
+            <div className="pane__model">
+              <select
+                className="pane__model-select"
+                value={activeModel || ''}
+                onChange={(e) => handleModelSwitch(e.target.value)}
+                disabled={isLoading}
+              >
+                {modelList.length === 0 && (
+                  <option value="">Loading models...</option>
+                )}
+                {modelList.map((m) => (
+                  <option key={m.key} value={m.key}>{m.name}</option>
+                ))}
+              </select>
+              {isUnion && (
+                <select
+                  className="pane__model-select"
+                  value={unionMode}
+                  onChange={(e) => setUnionMode(e.target.value)}
+                >
+                  {(currentModelInfo?.union_modes || []).map((mode) => (
+                    <option key={mode} value={mode}>{mode}</option>
+                  ))}
+                </select>
+              )}
+              {currentModelInfo && (
+                <div className="pane__model-stats">
+                  <span className="pane__model-stat" title="Output quality">
+                    <span className="pane__model-stat-k">Qual</span>
+                    {currentModelInfo.quality}
+                  </span>
+                  <span className="pane__model-stat" title="Inference speed">
+                    <span className="pane__model-stat-k">Spd</span>
+                    {currentModelInfo.speed}
+                  </span>
+                  <span className="pane__model-stat" title="Sketch adherence">
+                    <span className="pane__model-stat-k">Adh</span>
+                    {currentModelInfo.adherence}
+                  </span>
+                </div>
+              )}
             </div>
             <div className="pane__frame">
               <div className="pane__viewport pane__viewport--output">
