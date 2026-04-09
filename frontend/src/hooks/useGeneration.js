@@ -3,26 +3,22 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 const WS_URL = 'ws://localhost:8188/ws/generate';
 const STATUS_POLL_MS = 3000;
 
-/**
- * Core generation hook — manages the WebSocket connection, the
- * dirty/ready state machine, and exposes everything the UI needs.
- */
 export default function useGeneration() {
   const [backendStatus, setBackendStatus] = useState('connecting');
   const [genState, setGenState] = useState('idle');
   const [lastElapsed, setLastElapsed] = useState(null);
   const [statusMessage, setStatusMessage] = useState('Connecting to backend...');
   const [outputImage, setOutputImage] = useState(null);
+  const [activeModel, setActiveModel] = useState(null);
+  const [modelList, setModelList] = useState([]);
 
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
   const canvasRef = useRef(null);
 
-  // Dirty / ready flags for the request-reply loop
   const dirtyRef = useRef(false);
   const backendReadyRef = useRef(false);
 
-  // Latest parameter refs (avoids re-creating callbacks on every keystroke)
   const paramsRef = useRef({
     prompt: '',
     negativePrompt: '',
@@ -32,13 +28,14 @@ export default function useGeneration() {
     resolution: 512,
     seedLocked: false,
     seed: 42,
+    unionMode: null,
   });
 
   const updateParams = useCallback((partial) => {
     Object.assign(paramsRef.current, partial);
   }, []);
 
-  // ── Send latest canvas + params if both dirty & ready ──────
+  // ── Send if dirty + ready ──────────────────────────────────
   const trySend = useCallback(() => {
     if (!dirtyRef.current || !backendReadyRef.current) return;
     const ws = wsRef.current;
@@ -52,7 +49,7 @@ export default function useGeneration() {
     dirtyRef.current = false;
     backendReadyRef.current = false;
 
-    ws.send(JSON.stringify({
+    const msg = {
       type: 'generate',
       prompt: p.prompt,
       negative_prompt: p.negativePrompt,
@@ -62,7 +59,11 @@ export default function useGeneration() {
       adapter_scale: p.adapterScale,
       seed: p.seedLocked ? p.seed : null,
       size: p.resolution,
-    }));
+    };
+    if (p.unionMode) {
+      msg.union_mode = p.unionMode;
+    }
+    ws.send(JSON.stringify(msg));
   }, []);
 
   const markDirty = useCallback(() => {
@@ -70,7 +71,7 @@ export default function useGeneration() {
     trySend();
   }, [trySend]);
 
-  // ── WebSocket connection ───────────────────────────────────
+  // ── WebSocket ──────────────────────────────────────────────
   const connectWs = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) return;
 
@@ -79,8 +80,9 @@ export default function useGeneration() {
 
     ws.onopen = () => {
       setBackendStatus('loading');
-      setStatusMessage('Connected — loading model...');
+      setStatusMessage('Connected — checking status...');
       ws.send(JSON.stringify({ type: 'status' }));
+      ws.send(JSON.stringify({ type: 'list_models' }));
     };
 
     ws.onmessage = (evt) => {
@@ -89,9 +91,16 @@ export default function useGeneration() {
       switch (data.type) {
         case 'status':
           setBackendStatus(data.status);
-          if (data.status === 'loading') setStatusMessage(data.message || 'Loading model...');
-          else if (data.status === 'error') setStatusMessage(data.message || 'Backend error');
+          setActiveModel(data.model || null);
+          if (data.status === 'loading') setStatusMessage(data.message || 'Loading...');
+          else if (data.status === 'error') setStatusMessage(data.message || 'Error');
           else if (data.status === 'ready') setStatusMessage('');
+          else if (data.status === 'idle') setStatusMessage(data.message || 'No model loaded');
+          break;
+
+        case 'model_list':
+          setModelList(data.models);
+          setActiveModel(data.active);
           break;
 
         case 'ready_for_next':
@@ -114,7 +123,8 @@ export default function useGeneration() {
           break;
 
         case 'error':
-          console.error('Generation error:', data.message);
+          console.error('Backend error:', data.message);
+          setGenState('idle');
           break;
       }
     };
@@ -131,14 +141,12 @@ export default function useGeneration() {
 
   useEffect(() => {
     connectWs();
-
     const poll = setInterval(() => {
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'status' }));
       }
     }, STATUS_POLL_MS);
-
     return () => {
       clearInterval(poll);
       clearTimeout(reconnectTimer.current);
@@ -146,7 +154,18 @@ export default function useGeneration() {
     };
   }, [connectWs]);
 
-  // ── High-quality one-shot render ───────────────────────────
+  // ── Switch model ───────────────────────────────────────────
+  const switchModel = useCallback((key) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    backendReadyRef.current = false;
+    setBackendStatus('loading');
+    setStatusMessage('Switching model...');
+    setGenState('idle');
+    ws.send(JSON.stringify({ type: 'switch_model', model: key }));
+  }, []);
+
+  // ── HQ render ──────────────────────────────────────────────
   const requestHighQuality = useCallback(() => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -160,7 +179,7 @@ export default function useGeneration() {
     dirtyRef.current = false;
     setGenState('generating');
 
-    ws.send(JSON.stringify({
+    const msg = {
       type: 'generate',
       prompt: p.prompt,
       negative_prompt: p.negativePrompt,
@@ -170,10 +189,13 @@ export default function useGeneration() {
       adapter_scale: p.adapterScale,
       seed: p.seedLocked ? p.seed : null,
       size: 1024,
-    }));
+    };
+    if (p.unionMode) {
+      msg.union_mode = p.unionMode;
+    }
+    ws.send(JSON.stringify(msg));
   }, []);
 
-  // ── Clear output ───────────────────────────────────────────
   const clearOutput = useCallback(() => setOutputImage(null), []);
 
   return {
@@ -183,8 +205,11 @@ export default function useGeneration() {
     lastElapsed,
     statusMessage,
     outputImage,
+    activeModel,
+    modelList,
     markDirty,
     updateParams,
+    switchModel,
     requestHighQuality,
     clearOutput,
   };

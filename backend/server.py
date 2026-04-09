@@ -1,6 +1,8 @@
 """
 Live Canvas Art - Backend Server
-T2I-Adapter Sketch SDXL pipeline with WebSocket API for live sketch-to-image generation.
+
+Multi-model live sketch-to-image pipeline with WebSocket API.
+Supports T2I-Adapter, ControlNet, and ControlNet Union model families.
 """
 
 import asyncio
@@ -11,98 +13,40 @@ import time
 from contextlib import asynccontextmanager
 
 import torch
-from diffusers import (
-    EulerAncestralDiscreteScheduler,
-    StableDiffusionXLAdapterPipeline,
-    T2IAdapter,
-    AutoencoderKL,
-)
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
+from models import MODEL_REGISTRY, ModelManager, GenRequest
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Global pipeline holder
-# ---------------------------------------------------------------------------
-pipeline = None
-pipeline_ready = asyncio.Event()
-load_error: str | None = None
+PREVIEW_STEPS = 12
+PREVIEW_SIZE = 768
+HQ_STEPS = 30
+HQ_SIZE = 1024
+DEFAULT_MODEL = "t2i_sketch"
 
-PREVIEW_STEPS = 12          # fast preview
-PREVIEW_SIZE = 768           # resolution for interactive previews
-HQ_STEPS = 30               # high-quality render
-HQ_SIZE = 1024               # high-quality resolution
+# ── Global model manager ────────────────────────────────────────────
+manager = ModelManager()
 
 
-def load_pipeline():
-    """Load the full model stack once. Called at startup in a background thread."""
-    global pipeline, load_error
-
-    if not torch.cuda.is_available():
-        load_error = "CUDA is not available. This application requires an NVIDIA GPU with CUDA support."
-        logger.error(load_error)
-        return
-
-    device = torch.device("cuda")
-    dtype = torch.float16
-    logger.info("Loading T2I-Adapter sketch model...")
-
-    try:
-        adapter = T2IAdapter.from_pretrained(
-            "TencentARC/t2i-adapter-sketch-sdxl-1.0",
-            torch_dtype=dtype,
-            variant="fp16",
-        )
-
-        logger.info("Loading SDXL VAE (fp16-fix)...")
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix",
-            torch_dtype=dtype,
-        )
-
-        logger.info("Loading Stable Diffusion XL base pipeline...")
-        pipe = StableDiffusionXLAdapterPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            adapter=adapter,
-            vae=vae,
-            torch_dtype=dtype,
-            variant="fp16",
-        )
-
-        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-        pipe.to(device)
-
-        # Enable memory-efficient attention if xformers is available
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-            logger.info("xformers memory-efficient attention enabled.")
-        except Exception:
-            logger.info("xformers not available, using default attention.")
-
-        pipeline = pipe
-        logger.info("Pipeline loaded and ready on %s", device)
-
-    except Exception as e:
-        load_error = f"Failed to load pipeline: {e}"
-        logger.exception(load_error)
+def image_to_base64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
-# ---------------------------------------------------------------------------
-# App lifecycle
-# ---------------------------------------------------------------------------
+# ── App lifecycle ────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start model loading in a background thread so the server starts immediately
     loop = asyncio.get_event_loop()
 
-    async def _load():
-        await loop.run_in_executor(None, load_pipeline)
-        pipeline_ready.set()
+    async def _load_default():
+        await loop.run_in_executor(None, manager.load_model, DEFAULT_MODEL)
 
-    asyncio.create_task(_load())
+    asyncio.create_task(_load_default())
     yield
 
 
@@ -115,123 +59,48 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Health / status endpoint
-# ---------------------------------------------------------------------------
+# ── REST endpoints ──────────────────────────────────────────────────
 @app.get("/status")
 async def status():
-    if load_error:
-        return {"status": "error", "message": load_error}
-    if pipeline is None:
-        return {"status": "loading", "message": "Model is loading..."}
-    return {"status": "ready"}
+    return manager.get_status()
 
 
-# ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-def prepare_sketch_image(image_bytes: bytes, target_size: int) -> Image.Image:
-    """
-    Convert the frontend canvas to the adapter's expected format:
-    white lines on a black background, single-channel, resized to target_size
-    while preserving aspect ratio (padded to square).
-
-    The frontend sends a PNG where the drawing is black strokes on a white
-    (or transparent) background.  We need to invert this.
-    """
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")
-
-    # Invert: black strokes on white -> white strokes on black
-    from PIL import ImageOps
-    img = ImageOps.invert(img)
-
-    # Resize preserving aspect ratio, pad to square
-    w, h = img.size
-    scale = target_size / max(w, h)
-    new_w, new_h = int(w * scale), int(h * scale)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-
-    # Pad to target_size x target_size centered
-    padded = Image.new("L", (target_size, target_size), 0)
-    offset_x = (target_size - new_w) // 2
-    offset_y = (target_size - new_h) // 2
-    padded.paste(img, (offset_x, offset_y))
-
-    # Convert to RGB (adapter expects 3-channel)
-    return padded.convert("RGB")
+def _serialize_model(info):
+    entry = {
+        "key": info.key,
+        "name": info.name,
+        "family": info.family,
+        "description": info.description,
+        "default_conditioning_scale": info.default_conditioning_scale,
+        "quality": info.quality,
+        "speed": info.speed,
+        "adherence": info.adherence,
+        "size": info.size,
+        "input_type": info.input_type,
+    }
+    if info.union_modes:
+        entry["union_modes"] = list(info.union_modes.keys())
+    return entry
 
 
-def image_to_base64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode()
+@app.get("/models")
+async def list_models():
+    result = [_serialize_model(info) for info in MODEL_REGISTRY.values()]
+    return {"models": result, "active": manager.active_key}
 
 
-def is_blank_sketch(img: Image.Image, threshold: float = 0.005) -> bool:
-    """Check if the sketch is essentially blank (all black after inversion)."""
-    from PIL import ImageStat
-    stat = ImageStat.Stat(img.convert("L"))
-    # mean pixel value — if very low, sketch is blank
-    return (stat.mean[0] / 255.0) < threshold
-
-
-# ---------------------------------------------------------------------------
-# Inference
-# ---------------------------------------------------------------------------
-def run_inference(
-    prompt: str,
-    sketch_bytes: bytes,
-    negative_prompt: str = "",
-    steps: int = PREVIEW_STEPS,
-    guidance: float = 7.5,
-    adapter_scale: float = 0.9,
-    seed: int | None = None,
-    size: int = PREVIEW_SIZE,
-) -> str | None:
-    """Run a single inference pass. Returns base64-encoded JPEG or None."""
-    if pipeline is None:
-        return None
-
-    sketch_img = prepare_sketch_image(sketch_bytes, size)
-
-    if is_blank_sketch(sketch_img):
-        return None
-
-    if not prompt.strip():
-        prompt = "a drawing"
-
-    generator = None
-    if seed is not None and seed >= 0:
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-
-    with torch.inference_mode():
-        result = pipeline(
-            prompt=prompt,
-            negative_prompt=negative_prompt or "ugly, blurry, low quality, distorted",
-            image=sketch_img,
-            num_inference_steps=steps,
-            adapter_conditioning_scale=adapter_scale,
-            guidance_scale=guidance,
-            generator=generator,
-            num_images_per_prompt=1,
-        ).images[0]
-
-    return image_to_base64(result)
-
-
-# ---------------------------------------------------------------------------
-# WebSocket endpoint for live generation
+# ── WebSocket live generation ───────────────────────────────────────
 #
 # Protocol (request-reply, no queue):
-#   1. Client connects, server sends {"type":"status", ...} periodically
-#   2. When pipeline is ready, server sends {"type":"ready_for_next"}
-#   3. Client sends {"type":"generate", prompt, image, ...} with latest state
-#   4. Server sends {"type":"generating"}, runs inference, sends {"type":"result"}
-#   5. Server sends {"type":"ready_for_next"} — go to step 3
+#   Client connects → server sends status
+#   When ready → server sends {"type":"ready_for_next"}
+#   Client sends {"type":"generate", model, prompt, image, ...}
+#   Server sends {"type":"generating"}, runs inference, sends result
+#   Server sends {"type":"ready_for_next"} → repeat
 #
-# The frontend holds back until it receives ready_for_next, so at most one
-# generation is in flight at any time.  No queue, no cancellation, no races.
-# ---------------------------------------------------------------------------
+#   Client sends {"type":"switch_model", "model":"..."} to change model.
+#   Server unloads old, loads new, sends status updates, then ready_for_next.
+# ────────────────────────────────────────────────────────────────────
 @app.websocket("/ws/generate")
 async def ws_generate(ws: WebSocket):
     await ws.accept()
@@ -245,46 +114,81 @@ async def ws_generate(ws: WebSocket):
             data = await ws.receive_json()
             msg_type = data.get("type", "generate")
 
+            # ── Ping ──────────────────────────────────────────
             if msg_type == "ping":
                 await ws.send_json({"type": "pong"})
                 continue
 
+            # ── Status query ──────────────────────────────────
             if msg_type == "status":
-                if load_error:
-                    await ws.send_json({"type": "status", "status": "error", "message": load_error})
-                elif pipeline is None:
-                    await ws.send_json({"type": "status", "status": "loading", "message": "Model is loading..."})
-                else:
-                    await ws.send_json({"type": "status", "status": "ready"})
-                    # Also tell client it can send work
+                s = manager.get_status()
+                await ws.send_json({"type": "status", **s})
+                if manager.is_ready:
                     await ws.send_json({"type": "ready_for_next"})
                 continue
 
+            # ── Model list ────────────────────────────────────
+            if msg_type == "list_models":
+                await ws.send_json({
+                    "type": "model_list",
+                    "models": [_serialize_model(info) for info in MODEL_REGISTRY.values()],
+                    "active": manager.active_key,
+                })
+                continue
+
+            # ── Switch model ──────────────────────────────────
+            if msg_type == "switch_model":
+                requested = data.get("model", "")
+                if requested not in MODEL_REGISTRY:
+                    await ws.send_json({
+                        "type": "error",
+                        "message": f"Unknown model: {requested}",
+                    })
+                    continue
+
+                if requested == manager.active_key and manager.is_ready:
+                    await ws.send_json({"type": "status", "status": "ready", "model": requested})
+                    await ws.send_json({"type": "ready_for_next"})
+                    continue
+
+                await ws.send_json({
+                    "type": "status",
+                    "status": "loading",
+                    "message": f"Loading {MODEL_REGISTRY[requested].name}...",
+                    "model": requested,
+                })
+
+                await loop.run_in_executor(None, manager.load_model, requested)
+
+                s = manager.get_status()
+                await ws.send_json({"type": "status", **s})
+                if manager.is_ready:
+                    await ws.send_json({"type": "ready_for_next"})
+                continue
+
+            # ── Generate ──────────────────────────────────────
             if msg_type != "generate":
                 continue
 
-            # --- Generate request ---
             prompt = data.get("prompt", "")
             image_b64 = data.get("image", "")
             negative_prompt = data.get("negative_prompt", "")
             steps = int(data.get("steps", PREVIEW_STEPS))
             guidance = float(data.get("guidance", 7.5))
-            adapter_scale = float(data.get("adapter_scale", 0.9))
+            conditioning_scale = float(data.get("adapter_scale", 0.9))
             seed = data.get("seed", None)
             if seed is not None:
                 seed = int(seed)
             size = int(data.get("size", PREVIEW_SIZE))
+            union_mode = data.get("union_mode", None)
 
             if not image_b64:
                 await ws.send_json({"type": "ready_for_next"})
                 continue
 
-            if pipeline is None:
-                await ws.send_json({
-                    "type": "status",
-                    "status": "loading",
-                    "message": "Model still loading, please wait...",
-                })
+            if not manager.is_ready:
+                s = manager.get_status()
+                await ws.send_json({"type": "status", **s})
                 continue
 
             generation_id += 1
@@ -293,15 +197,25 @@ async def ws_generate(ws: WebSocket):
 
             await ws.send_json({"type": "generating", "generation_id": gid})
 
+            req = GenRequest(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image_bytes=image_bytes,
+                steps=steps,
+                guidance=guidance,
+                conditioning_scale=conditioning_scale,
+                seed=seed,
+                size=size,
+                union_mode=union_mode,
+            )
+
             try:
                 t0 = time.perf_counter()
-                result_b64 = await loop.run_in_executor(
-                    None, run_inference, prompt, image_bytes, negative_prompt,
-                    steps, guidance, adapter_scale, seed, size,
-                )
+                result_img = await loop.run_in_executor(None, manager.generate, req)
                 elapsed = time.perf_counter() - t0
 
-                if result_b64:
+                if result_img is not None:
+                    result_b64 = image_to_base64(result_img)
                     await ws.send_json({
                         "type": "result",
                         "image": result_b64,
@@ -322,7 +236,6 @@ async def ws_generate(ws: WebSocket):
                     "generation_id": gid,
                 })
 
-            # Signal client to send next frame
             await ws.send_json({"type": "ready_for_next"})
 
     except WebSocketDisconnect:
@@ -331,9 +244,7 @@ async def ws_generate(ws: WebSocket):
         logger.exception("WebSocket error: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Main ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8188, log_level="info")

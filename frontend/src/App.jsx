@@ -5,7 +5,7 @@ import DrawingCanvas from './components/DrawingCanvas.jsx';
 export default function App() {
   const [prompt, setPrompt] = useState('');
   const [brushSize, setBrushSize] = useState(4);
-  const [tool, setTool] = useState('brush'); // brush | eraser
+  const [tool, setTool] = useState('brush');
 
   // Generation settings
   const [cfgScale, setCfgScale] = useState(7.5);
@@ -14,6 +14,7 @@ export default function App() {
   const [resolution, setResolution] = useState(512);
   const [seedLocked, setSeedLocked] = useState(false);
   const [seed, setSeed] = useState(42);
+  const [unionMode, setUnionMode] = useState('scribble');
 
   const {
     canvasRef,
@@ -22,17 +23,36 @@ export default function App() {
     lastElapsed,
     statusMessage,
     outputImage,
+    activeModel,
+    modelList,
     markDirty,
     updateParams,
+    switchModel,
     requestHighQuality,
     clearOutput,
   } = useGeneration();
 
+  // Find current model info from list
+  const currentModelInfo = modelList.find((m) => m.key === activeModel);
+  const isUnion = currentModelInfo?.family === 'controlnet_union';
+
   // Sync params to hook
   useEffect(() => {
-    updateParams({ prompt, negativePrompt: '', steps, cfgScale, adapterScale, resolution, seedLocked, seed });
+    updateParams({
+      prompt, negativePrompt: '', steps, cfgScale, adapterScale, resolution,
+      seedLocked, seed, unionMode: isUnion ? unionMode : null,
+    });
     markDirty();
-  }, [prompt, steps, cfgScale, adapterScale, resolution, seedLocked, seed, updateParams, markDirty]);
+  }, [prompt, steps, cfgScale, adapterScale, resolution, seedLocked, seed, unionMode, isUnion, updateParams, markDirty]);
+
+  // When switching models, apply that model's default conditioning scale
+  const handleModelSwitch = useCallback((key) => {
+    const info = modelList.find((m) => m.key === key);
+    if (info) {
+      setAdapterScale(info.default_conditioning_scale);
+    }
+    switchModel(key);
+  }, [modelList, switchModel]);
 
   const handleClear = useCallback(() => {
     const canvas = canvasRef.current;
@@ -45,6 +65,7 @@ export default function App() {
 
   const isReady = backendStatus === 'ready';
   const isGenerating = genState === 'generating';
+  const isLoading = backendStatus === 'loading';
 
   const statusColor = {
     connecting: 'var(--status-connecting)',
@@ -53,6 +74,10 @@ export default function App() {
     error: 'var(--status-error)',
   }[backendStatus] || 'var(--text-faint)';
 
+  const statusLabel = isReady
+    ? 'Live'
+    : isLoading ? 'Loading' : backendStatus === 'error' ? 'Error' : 'Offline';
+
   return (
     <div className="app">
 
@@ -60,12 +85,55 @@ export default function App() {
       <header className="header">
         <div className="header__left">
           <span className="header__logo">Canvas</span>
-          <span className="header__badge">SDXL T2I-Adapter</span>
+          <select
+            className="header__model-select"
+            value={activeModel || ''}
+            onChange={(e) => handleModelSwitch(e.target.value)}
+            disabled={isLoading}
+          >
+            {modelList.length === 0 && (
+              <option value="">Loading models...</option>
+            )}
+            {modelList.map((m) => (
+              <option key={m.key} value={m.key}>{m.name}</option>
+            ))}
+          </select>
+          {isUnion && (
+            <select
+              className="header__union-select"
+              value={unionMode}
+              onChange={(e) => setUnionMode(e.target.value)}
+            >
+              {(currentModelInfo?.union_modes || []).map((mode) => (
+                <option key={mode} value={mode}>{mode}</option>
+              ))}
+            </select>
+          )}
+          {currentModelInfo && (
+            <div className="header__stats">
+              <span className="header__stat" title="Output quality">
+                <span className="header__stat-label">Quality</span>
+                <span className="header__stat-value">{currentModelInfo.quality}</span>
+              </span>
+              <span className="header__stat" title="Inference speed">
+                <span className="header__stat-label">Speed</span>
+                <span className="header__stat-value">{currentModelInfo.speed}</span>
+              </span>
+              <span className="header__stat" title="How closely output follows sketch lines">
+                <span className="header__stat-label">Adherence</span>
+                <span className="header__stat-value">{currentModelInfo.adherence}</span>
+              </span>
+              <span className="header__stat" title="Model download size">
+                <span className="header__stat-label">Size</span>
+                <span className="header__stat-value">{currentModelInfo.size}</span>
+              </span>
+            </div>
+          )}
         </div>
         <div className="header__right">
           <span className="header__live">
             <span className="header__dot" style={{ background: statusColor }} />
-            {isReady ? 'Live' : backendStatus === 'loading' ? 'Loading' : backendStatus === 'error' ? 'Error' : 'Offline'}
+            {statusLabel}
           </span>
           {lastElapsed != null && !isGenerating && (
             <span className="header__fps">{lastElapsed}s</span>
