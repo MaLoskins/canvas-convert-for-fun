@@ -223,7 +223,6 @@ class BaseAdapter(ABC):
     def unload(self) -> None:
         """Release GPU memory."""
         if self.pipe is not None:
-            self.pipe.to("cpu")
             del self.pipe
             self.pipe = None
         gc.collect()
@@ -339,6 +338,19 @@ class ControlNetAdapter(BaseAdapter):
 
 
 class MistoLineAdapter(ControlNetAdapter):
+    def load(self, vae):
+        logger.info("Loading ControlNet [%s] from %s ...", self.info.key, self.info.repo)
+        controlnet = ControlNetModel.from_pretrained(
+            self.info.repo, torch_dtype=DTYPE, variant="fp16",
+        )
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            SDXL_BASE, controlnet=controlnet, vae=vae, torch_dtype=DTYPE, variant="fp16",
+        )
+        self._apply_scheduler_and_opts(pipe)
+        pipe.to(DEVICE)
+        self.pipe = pipe
+        logger.info("ControlNet [%s] ready.", self.info.key)
+
     def preprocess(self, raw, size):
         return preprocess_mistoline(raw, size)
 
@@ -397,7 +409,7 @@ class ControlNetUnionAdapter(BaseAdapter):
             return self.pipe(
                 prompt=prompt,
                 negative_prompt=req.negative_prompt or "ugly, blurry, low quality, distorted",
-                image=ctrl,
+                control_image=ctrl,
                 num_inference_steps=req.steps,
                 controlnet_conditioning_scale=req.conditioning_scale,
                 guidance_scale=req.guidance,
